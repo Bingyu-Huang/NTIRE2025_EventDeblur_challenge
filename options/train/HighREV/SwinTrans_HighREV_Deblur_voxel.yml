@@ -1,0 +1,133 @@
+# general settings
+name: SwinEventDeblur_highrev_deblur_voxel_debug
+model_type: ImageEventRestorationModel
+scale: 1
+num_gpu: 1  # Adjust based on your hardware
+manual_seed: 10
+
+datasets:
+  train:
+    name: highrev-train
+    type: VoxelnpzPngSingleDeblurDataset
+    dataroot: /scratch/NTIRE/HighREV/train
+    dataroot_voxel: /scratch/NTIRE/HighREV_voxel/train/voxel
+
+    voxel_bins: 6
+    gt_size: 256
+    # keep true if use events
+    norm_voxel: true
+    use_hflip: true
+    use_rot: true
+
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+      
+    # data loader settings
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 4  # Adjust based on your GPU memory
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cpu
+    num_prefetch_queue: 2
+
+  val:
+    name: highrev-val
+    type: VoxelnpzPngSingleDeblurDataset
+    voxel_bins: 6
+    dataroot: /scratch/NTIRE/HighREV/val
+    dataroot_voxel: /scratch/NTIRE/HighREV_voxel/val/voxel
+
+    gt_size: ~
+    norm_voxel: true  
+
+    io_backend:
+      type: disk
+    
+    use_hflip: false
+    use_rot: false
+
+dataset_name: HighREV
+
+# network structures
+network_g:
+  type: SwinEventDeblur
+  img_size: 256
+  patch_size: 4
+  in_chans: 3
+  event_chans: 6
+  embed_dim: 96
+  depths: [2, 2, 6, 2]
+  num_heads: [3, 6, 12, 24]
+  window_size: 8
+  mlp_ratio: 4.0
+  qkv_bias: true
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  ape: false
+  patch_norm: true
+  use_checkpoint: false
+  skip_fusion: true
+
+# path
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  training_states: ~
+
+# training settings
+train:
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: TrueCosineAnnealingLR
+    T_max: 200000
+    eta_min: !!float 1e-7
+
+  total_iter: 200000
+  warmup_iter: 5000  # Added warm-up for Swin Transformer
+
+  # losses
+  pixel_opt:
+    type: PSNRLoss
+    loss_weight: 0.5
+    reduction: mean
+
+# validation settings
+val:
+  val_freq: !!float 5e4
+  save_img: false
+  grids: ~
+  crop_size: ~
+  max_minibatch: 8
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 200
+  save_checkpoint_freq: !!float 2e4
+  use_tb_logger: true
+  wandb:
+    project: NTIRE2025_EventDeblur
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
