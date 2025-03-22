@@ -602,12 +602,22 @@ class EventImageFusionLayer(nn.Module):
         Returns:
             Tuple of processed image and event features
         """
+        if torch.is_grad_enabled() and self.training:
+            print(f"[FusionLayer] Input - x_img: {x_img.shape}, x_event: {x_event.shape}")
+
         # Process event stream with self-attention
         for i, event_blk in enumerate(self.event_blocks):
+            if self.training and torch.is_grad_enabled():
+                print(f"[FusionLayer] Before event block {i} - event shape: {x_event.shape}")
+
             if self.use_checkpoint:
                 x_event = torch.utils.checkpoint.checkpoint(event_blk, x_event)
             else:
                 x_event = event_blk(x_event)
+
+            if self.training and torch.is_grad_enabled():
+                print(f"[FusionLayer] After event block {i} - event shape: {x_event.shape}")
+                print(f"[FusionLayer] Before fusion block {i} - img: {x_img.shape}, event: {x_event.shape}")
 
             # After each event self-attention, apply cross-attention fusion
             fusion_blk = self.fusion_blocks[i]
@@ -616,10 +626,19 @@ class EventImageFusionLayer(nn.Module):
             else:
                 x_img = fusion_blk(x_img, x_event)
 
+            if self.training and torch.is_grad_enabled():
+                print(f"[FusionLayer] After fusion block {i} - img shape: {x_img.shape}")
+
         # Apply downsampling if needed
         if self.downsample_img is not None:
+            if self.training and torch.is_grad_enabled():
+                print(f"[FusionLayer] Before downsampling - img: {x_img.shape}, event: {x_event.shape}")
+
             x_img = self.downsample_img(x_img)
             x_event = self.downsample_event(x_event)
+
+            if self.training and torch.is_grad_enabled():
+                print(f"[FusionLayer] After downsampling - img: {x_img.shape}, event: {x_event.shape}")
 
         return x_img, x_event
 
@@ -879,9 +898,15 @@ class SwinEventDeblur(nn.Module):
 
     def forward_features(self, img, event):
         """Forward pass through feature extraction part of the network"""
+        if self.training:
+            print(f"[Features] Input shapes - img: {img.shape}, event: {event.shape}")
+
         # Embed patches
         img_features = self.patch_embed_img(img)  # B, L, C
         event_features = self.patch_embed_event(event)  # B, L, C
+
+        if self.training:
+            print(f"[Features] After patch embedding - img: {img_features.shape}, event: {event_features.shape}")
 
         # Add position embedding if used
         if self.ape:
@@ -896,18 +921,30 @@ class SwinEventDeblur(nn.Module):
         event_skips = []
 
         # Forward through encoder layers
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             img_skips.append(img_features)
             event_skips.append(event_features)
+            if self.training:
+                print(f"[Features] Before layer {i} - img: {img_features.shape}, event: {event_features.shape}")
+
             img_features, event_features = layer(img_features, event_features)
+
+            if self.training:
+                print(f"[Features] After layer {i} - img: {img_features.shape}, event: {event_features.shape}")
 
         # Normalize features
         img_features = self.norm(img_features)
+
+        if self.training:
+            print(f"[Features] Final normalized img features: {img_features.shape}")
 
         return img_features, event_features, img_skips, event_skips
 
     def forward_decoder(self, img_features, event_features, img_skips, event_skips):
         """Forward pass through decoder part of the network"""
+        if self.training:
+            print(f"[Decoder] Initial shapes - img: {img_features.shape}, event: {event_features.shape}")
+            print(f"[Decoder] Skip connection counts - img: {len(img_skips)}, event: {len(event_skips)}")
 
         # Loop through decoder layers
         i = 0
@@ -923,8 +960,23 @@ class SwinEventDeblur(nn.Module):
                     skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
                     skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
 
+                    if self.training:
+                        print(
+                            f"[Decoder] Skip connection {skip_idx} - skip_img: {skip_img.shape}, skip_event: {skip_event.shape}")
+
                     img_features = img_features + skip_img
                     event_features = event_features + skip_event
+
+                if self.training:
+                    print(
+                        f"[Decoder] Before fusion layer {i} - img: {img_features.shape}, event: {event_features.shape}")
+
+                # Process with fusion layer
+                img_features, event_features = self.decoder_layers[i](img_features, event_features)
+
+                if self.training:
+                    print(
+                        f"[Decoder] After fusion layer {i} - img: {img_features.shape}, event: {event_features.shape}")
 
                 # Save intermediate output for SAM (at 1/4 resolution)
                 if i == len(self.decoder_layers) - 2:  # Before the final expansion
@@ -933,12 +985,24 @@ class SwinEventDeblur(nn.Module):
                     sam_features = img_features.transpose(1, 2).view(B, C, H, W)
                     sam_output = self.sam(sam_features)
 
+                    if self.training:
+                        print(f"[Decoder] SAM features shape: {sam_features.shape}, output: {sam_output.shape}")
+
                 i += 1
 
             # Process expansion layer
             elif isinstance(self.decoder_layers[i], (PatchExpand, FinalPatchExpand_X4)):
+                if self.training:
+                    print(
+                        f"[Decoder] Before expansion layer {i} - img: {img_features.shape}, event: {event_features.shape}")
+
                 img_features = self.decoder_layers[i](img_features)
                 event_features = self.decoder_layers[i](event_features)
+
+                if self.training:
+                    print(
+                        f"[Decoder] After expansion layer {i} - img: {img_features.shape}, event: {event_features.shape}")
+
                 i += 1
 
         # Final processing
@@ -946,21 +1010,42 @@ class SwinEventDeblur(nn.Module):
         H = W = int(math.sqrt(L))
         output_features = img_features.transpose(1, 2).view(B, C, H, W)
 
+        if self.training:
+            print(f"[Decoder] Final output features shape: {output_features.shape}")
+
         return output_features, sam_output
 
     def forward(self, x, event):
+        if self.training:
+            print(f"[Forward] Input image shape: {x.shape}")
+            print(f"[Forward] Input event shape: {event.shape}")
+
         img = x
         # Forward through feature extraction
         img_features, event_features, img_skips, event_skips = self.forward_features(img, event)
 
+        if self.training:
+            print(f"[Forward] After features - img_features shape: {img_features.shape}")
+            print(f"[Forward] After features - event_features shape: {event_features.shape}")
+            print(f"[Forward] Number of image skip connections: {len(img_skips)}")
+
         # Forward through decoder
         decoded_features, sam_output = self.forward_decoder(img_features, event_features, img_skips, event_skips)
 
+        if self.training:
+            print(f"[Forward] Decoded features shape: {decoded_features.shape}")
+            if sam_output is not None:
+                print(f"[Forward] SAM output shape: {sam_output.shape}")
+
         # Final output
         output = self.final_conv(decoded_features)
+        if self.training:
+            print(f"[Forward] Before residual connection shape: {output.shape}")
+
         output = output + img  # Residual connection
 
         if self.training:
+            print(f"[Forward] Final output shape: {output.shape}")
             return [sam_output, output]  # Return both outputs during training
         else:
             return output  # Return only final output during inference
