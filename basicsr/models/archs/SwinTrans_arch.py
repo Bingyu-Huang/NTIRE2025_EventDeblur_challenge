@@ -974,24 +974,33 @@ class SwinEventDeblur(nn.Module):
                 if len(img_skips) > 0 and self.skip_fusion:
                     skip_idx = len(img_skips) - 1
 
-                    # Ensure skip_idx is within range of self.skip_adapters
+                    # Check if the skip_idx is within the range of available adapters
                     if skip_idx < len(self.skip_adapters):
-                        skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
-                        skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
+                        try:
+                            skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
+                            skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
 
-                        if self.training:
-                            print(
-                                f"[Decoder] Skip connection {skip_idx} - skip_img: {skip_img.shape}, skip_event: {skip_event.shape}")
+                            if self.training:
+                                print(
+                                    f"[Decoder] Skip connection {skip_idx} - skip_img: {skip_img.shape}, skip_event: {skip_event.shape}")
 
-                        img_features = img_features + skip_img
-                        event_features = event_features + skip_event
+                            # Ensure dimensions match before adding
+                            if skip_img.shape == img_features.shape and skip_event.shape == event_features.shape:
+                                img_features = img_features + skip_img
+                                event_features = event_features + skip_event
+                            else:
+                                if self.training:
+                                    print(f"[Decoder] WARNING: Skip connection shapes don't match - skipping addition")
+                        except Exception as e:
+                            if self.training:
+                                print(f"[Decoder] Error processing skip connection: {e}")
+                            # Continue without the skip connection
                     else:
-                        # Skip connection index out of range, just pop and discard
+                        # Just pop and discard if no adapter is available
                         if self.training:
-                            print(f"[Decoder] Skip connection {skip_idx} - SKIPPED (adapter index out of range)")
+                            print(f"[Decoder] Skip adapter index {skip_idx} out of range. Discarding skip connection.")
                         img_skips.pop()
                         event_skips.pop()
-
 
                 if self.training:
                     print(
@@ -1003,7 +1012,7 @@ class SwinEventDeblur(nn.Module):
                 if self.training:
                     print(
                         f"[Decoder] After fusion layer {i} - img: {img_features.shape}, event: {event_features.shape}")
-
+                    
                 # Save intermediate output for SAM (at 1/4 resolution)
                 if i == len(self.decoder_layers) - 2:  # Before the final expansion
                     B, L, C = img_features.shape
