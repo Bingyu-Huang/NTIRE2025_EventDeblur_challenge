@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import math
-
+from einops import rearrange
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -448,34 +448,16 @@ class PatchExpand(nn.Module):
         self.norm = norm_layer(dim)
 
     def forward(self, x):
-        """
-        x: B, H*W, C
-        """
         H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
         x = x.view(B, H, W, C)
-        x = x.view(B, H, W, 2, C // 2)
-        x = x.permute(0, 1, 3, 2, 4)  # B, H, 2, W, C//2
-        x = x.reshape(B, H * 2, W, C // 2)
-        x = x.view(B, H * 2, W, 1, C // 2)
-        x = x.permute(0, 1, 3, 2, 4)  # B, H*2, 1, W, C//2
-        x = x.reshape(B, H * 2, W * 1, C // 2)
-        x = x.view(B, H * 2, W, C // 2)
-        x = x.view(B, H * 2, W, 1, C // 2)
-        x = x.permute(0, 1, 3, 2, 4)  # B, H*2, 1, W, C//2
-        x = x.reshape(B, H * 2, W * 1, C // 2)
-        x = x.view(B, H * 2, W * 1, C // 2)
-        x = x.view(B, H * 2, W * 1, 1, C // 2)
-        x = x.permute(0, 1, 3, 2, 4)  # B, H*2, 1, W*1, C//2
-        x = x.reshape(B, H * 2, W * 1 * 1, C // 2)
-        x = x.view(B, H * 2, W * 1 * 1, C // 2)
-        x = x.reshape(B, -1, C // 2)
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=1, c=C // 2)
+        x = x.view(B, -1, C // 2)
 
         x = self.norm(x)
-
         return x
 
 
@@ -682,6 +664,36 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class SkipAdapter(nn.Module):
+    def __init__(self, in_dim, out_dim, input_resolution):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.adapter = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x, target_shape):
+        B, L, C = x.shape
+        target_L = target_shape[1]
+
+        # If sequence lengths match, only adapt channels
+        if L == target_L:
+            return self.norm(self.adapter(x))
+
+        # Handle sequence length mismatch
+        H, W = self.input_resolution
+        # Calculate target resolution
+        target_H = int(math.sqrt(target_L))
+        target_W = target_L // target_H
+
+        # Reshape to 2D, adapt spatial dimensions, then reshape back
+        x = x.transpose(1, 2).view(B, C, H, W)
+        x = F.interpolate(x, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        x = x.flatten(2).transpose(1, 2)
+
+        # Adapt channels if needed
+        x = self.adapter(x)
+        return self.norm(x)
+
 class SwinEventDeblur(nn.Module):
     """Swin Transformer based architecture for event-based deblurring
 
@@ -768,6 +780,16 @@ class SwinEventDeblur(nn.Module):
                 downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint)
             self.layers.append(layer)
+
+        # Skip connection adapters
+        self.skip_adapters = nn.ModuleList()
+        for i_layer in range(self.num_layers - 1):
+            in_dim = int(embed_dim * 2 ** i_layer)
+            out_dim = int(embed_dim * 2 ** (self.num_layers - i_layer - 1))
+            input_resolution = (patches_resolution[0] // (2 ** i_layer),
+                                patches_resolution[1] // (2 ** i_layer))
+
+            self.skip_adapters.append(SkipAdapter(in_dim, out_dim, input_resolution))
 
         # Build decoder layers
         self.decoder_layers = nn.ModuleList()
@@ -895,36 +917,14 @@ class SwinEventDeblur(nn.Module):
             # Process fusion layer if it's a transformer block
             if isinstance(self.decoder_layers[i], EventImageFusionLayer):
                 # Add skip connections if available and enabled
+                # Combine with skip connection
                 if len(img_skips) > 0 and self.skip_fusion:
-                    skip_img = img_skips.pop()
-                    skip_event = event_skips.pop()
+                    skip_idx = len(img_skips) - 1
+                    skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
+                    skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
 
-                    # For the bottleneck layer, simply use the encoded features
-                    if i == 0:
-                        img_features, event_features = self.decoder_layers[i](img_features, event_features)
-                    else:
-                        # Size check and adaptation (might need interpolation in edge cases)
-                        if img_features.shape[1] != skip_img.shape[1]:
-                            B, L, C = img_features.shape
-                            target_L = skip_img.shape[1]
-                            H = W = int(math.sqrt(L))
-                            img_features = img_features.transpose(1, 2).view(B, C, H, W)
-                            img_features = F.interpolate(img_features, size=int(math.sqrt(target_L)), mode='bilinear')
-                            img_features = img_features.flatten(2).transpose(1, 2)
-
-                            event_features = event_features.transpose(1, 2).view(B, C, H, W)
-                            event_features = F.interpolate(event_features, size=int(math.sqrt(target_L)),
-                                                           mode='bilinear')
-                            event_features = event_features.flatten(2).transpose(1, 2)
-
-                        # Combine with skip connection (can be modified to use more sophisticated fusion)
-                        img_features = img_features + skip_img
-                        event_features = event_features + skip_event
-
-                        # Process through the layer
-                        img_features, event_features = self.decoder_layers[i](img_features, event_features)
-                else:
-                    img_features, event_features = self.decoder_layers[i](img_features, event_features)
+                    img_features = img_features + skip_img
+                    event_features = event_features + skip_event
 
                 # Save intermediate output for SAM (at 1/4 resolution)
                 if i == len(self.decoder_layers) - 2:  # Before the final expansion
