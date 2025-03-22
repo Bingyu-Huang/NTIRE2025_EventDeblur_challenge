@@ -883,6 +883,21 @@ class SwinEventDeblur(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Skip connection adapters
+        self.skip_adapters = nn.ModuleList()
+        for i_layer in range(self.num_layers):  # Change from range(self.num_layers - 1)
+            in_dim = int(embed_dim * 2 ** i_layer)
+            # For the last layer, we need a special case since there's no next layer
+            if i_layer == self.num_layers - 1:
+                out_dim = in_dim  # Same dimension for the last skip connection
+            else:
+                out_dim = int(embed_dim * 2 ** (self.num_layers - i_layer - 1))
+
+            input_resolution = (patches_resolution[0] // (2 ** i_layer),
+                                patches_resolution[1] // (2 ** i_layer))
+
+            self.skip_adapters.append(SkipAdapter(in_dim, out_dim, input_resolution))
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -945,6 +960,7 @@ class SwinEventDeblur(nn.Module):
         if self.training:
             print(f"[Decoder] Initial shapes - img: {img_features.shape}, event: {event_features.shape}")
             print(f"[Decoder] Skip connection counts - img: {len(img_skips)}, event: {len(event_skips)}")
+            print(f"[Decoder] Number of skip adapters: {len(self.skip_adapters)}")
 
         # Loop through decoder layers
         i = 0
@@ -957,15 +973,25 @@ class SwinEventDeblur(nn.Module):
                 # Combine with skip connection
                 if len(img_skips) > 0 and self.skip_fusion:
                     skip_idx = len(img_skips) - 1
-                    skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
-                    skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
 
-                    if self.training:
-                        print(
-                            f"[Decoder] Skip connection {skip_idx} - skip_img: {skip_img.shape}, skip_event: {skip_event.shape}")
+                    # Ensure skip_idx is within range of self.skip_adapters
+                    if skip_idx < len(self.skip_adapters):
+                        skip_img = self.skip_adapters[skip_idx](img_skips.pop(), img_features.shape)
+                        skip_event = self.skip_adapters[skip_idx](event_skips.pop(), event_features.shape)
 
-                    img_features = img_features + skip_img
-                    event_features = event_features + skip_event
+                        if self.training:
+                            print(
+                                f"[Decoder] Skip connection {skip_idx} - skip_img: {skip_img.shape}, skip_event: {skip_event.shape}")
+
+                        img_features = img_features + skip_img
+                        event_features = event_features + skip_event
+                    else:
+                        # Skip connection index out of range, just pop and discard
+                        if self.training:
+                            print(f"[Decoder] Skip connection {skip_idx} - SKIPPED (adapter index out of range)")
+                        img_skips.pop()
+                        event_skips.pop()
+
 
                 if self.training:
                     print(
